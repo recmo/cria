@@ -21,6 +21,7 @@ def main(
     model_size: str = "7B",
     models_dir: str = "models",
     max_seq_len: int = 512,
+    temperature: float = 0.8, # TODO
 ):
     # Load Tokenizer
     tokenizer = SentencePieceProcessor(model_file=f"{models_dir}/tokenizer.model")
@@ -66,71 +67,84 @@ def main(
             data = Unpickler(data_pkl).load()
 
     print(params)
-    for (key, value) in data.items():
-        print(key, value.shape)
+    # for (key, value) in data.items():
+    #     print(key, value.shape)
     head_dim = params['dim'] // params['n_heads']
     
     # Compute freq_cis
     freqs = np.logspace(0, 1.0, base=1e-4, num=head_dim // 2, endpoint=False)
     freqs_cis = np.exp(1j * np.outer(np.arange(2 * max_seq_len), freqs)).astype(np.complex64)
+    print("freqs_cis = ", freqs_cis.shape, freqs_cis)
 
     # Tokenize prompt
     tokens = [tokenizer.bos_id()] + tokenizer.encode(prompt)
     # tokens += [tokenizer.pad_id()] * n_tokens_to_generate
     print(f"Encoded \"{prompt}\" to {tokens}")
 
-    # Embed tokens
-    h = data['tok_embeddings.weight'][tokens,:].astype(np.float32)
-    print("h = ", h.shape, h)
+    for _ in range(n_tokens_to_generate):
 
-    start_pos = 0
-    seq_len = 8
-    freqs_cis = freqs_cis[start_pos : start_pos + seq_len]
-    # print("freqs_cis = ", freqs_cis.shape, freqs_cis)
+        # Embed tokens
+        h = data['tok_embeddings.weight'][tokens,:].astype(np.float32)
+        # print("h = ", h.shape, h)
+        # TODO: Cache
 
-    for layer in range(params['n_layers']):
-        print("layer = ", layer)
+        start_pos = 0
+        seq_len = len(tokens)
+        f = freqs_cis[start_pos : start_pos + seq_len].reshape(-1, 1, head_dim // 2)
+        # print("f = ", f.shape, f)
 
-        # QKV projections
-        wa = data[f'layers.{layer}.attention_norm.weight']
-        wq = data[f'layers.{layer}.attention.wq.weight']
-        wk = data[f'layers.{layer}.attention.wk.weight']
-        wv = data[f'layers.{layer}.attention.wv.weight']
-        wo = data[f'layers.{layer}.attention.wo.weight']
-        shape = (-1, params['n_heads'], head_dim)
-        xn = rms_norm(h) * wa
-        xq = (xn @ wq.T).reshape(shape)
-        xk = (xn @ wk.T).reshape(shape)
-        xv = (xn @ wv.T).reshape(shape)
+        for layer in range(params['n_layers']):
+            print("layer = ", layer)
 
-        # Rotary embedding
-        f = freqs_cis.reshape(-1, 1, xq.shape[-1] // 2)
-        xq = (xq.view(dtype=np.complex64) * f).view(dtype=np.float32)
-        xk = (xk.view(dtype=np.complex64) * f).view(dtype=np.float32)
+            # QKV projections
+            wa = data[f'layers.{layer}.attention_norm.weight']
+            wq = data[f'layers.{layer}.attention.wq.weight']
+            wk = data[f'layers.{layer}.attention.wk.weight']
+            wv = data[f'layers.{layer}.attention.wv.weight']
+            wo = data[f'layers.{layer}.attention.wo.weight']
+            shape = (-1, params['n_heads'], head_dim)
+            xn = rms_norm(h) * wa
+            xq = (xn @ wq.T).reshape(shape)
+            xk = (xn @ wk.T).reshape(shape)
+            xv = (xn @ wv.T).reshape(shape)
 
-        # Attention
-        scores = np.matmul(xk, xq, axes=[(0,2),(2,0),(2,1)]) / np.sqrt(head_dim)
-        #if layer == 0:
-        mask = -1e10 * (1 - np.tri(seq_len))
-        scores += mask
-        scores = softmax(scores)
-        output = np.matmul(scores, xv, axes=[(1,2), (0,2), (0,2)]).reshape(-1, params['dim'])
-        h += output @ wo.T
+            # Rotary embedding
+            xq = (xq.view(dtype=np.complex64) * f).view(dtype=np.float32)
+            xk = (xk.view(dtype=np.complex64) * f).view(dtype=np.float32)
 
-        # Feed forward neural network
-        wn = data[f'layers.{layer}.ffn_norm.weight']
-        w1 = data[f'layers.{layer}.feed_forward.w1.weight']
-        w2 = data[f'layers.{layer}.feed_forward.w2.weight']
-        w3 = data[f'layers.{layer}.feed_forward.w3.weight']
-        xn = rms_norm(h) * wn
-        x1 = xn @ w1.T
-        h += ((x1 / (1.0 + np.exp(-x1))) * (xn @ w3.T)) @ w2.T
+            # Attention
+            scores = np.matmul(xk, xq, axes=[(0,2),(2,0),(2,1)]) / np.sqrt(head_dim)
+            #if mask:
+            mask = -1e10 * (1 - np.tri(seq_len))
+            scores += mask
+            scores = softmax(scores)
+            output = np.matmul(scores, xv, axes=[(1,2), (0,2), (0,2)]).reshape(-1, params['dim'])
+            h += output @ wo.T
 
-        print("h = ", h.shape, h)
+            # Feed forward neural network
+            wn = data[f'layers.{layer}.ffn_norm.weight']
+            w1 = data[f'layers.{layer}.feed_forward.w1.weight']
+            w2 = data[f'layers.{layer}.feed_forward.w2.weight']
+            w3 = data[f'layers.{layer}.feed_forward.w3.weight']
+            xn = rms_norm(h) * wn
+            x1 = xn @ w1.T
+            h += ((x1 / (1.0 + np.exp(-x1))) * (xn @ w3.T)) @ w2.T
 
-    # Untokenize result
-    #result = tokenizer.decode(tokens)
-    #print(result)
+            #print("h = ", h.shape, h)
+        
+        # Output norm
+        wn = data['norm.weight']
+        wo = data['output.weight']
+        h = rms_norm(h) * wn
+        logits = h[-1, :] @ wo.T # Last logits
+
+        # Select next token
+        # TODO: Temperature
+        tokens.append(int(np.argmax(logits)))
+
+        # Untokenize result
+        result = tokenizer.decode(tokens)
+        print(result)
 
 if __name__ == "__main__":
     import fire
