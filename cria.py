@@ -17,7 +17,7 @@ def softmax(x):
 
 def main(
     prompt: str = "I believe the meaning of life is",
-    n_tokens_to_generate: int = 5,
+    n_tokens_to_generate: int = 50,
     model_size: str = "7B",
     models_dir: str = "models",
     max_seq_len: int = 512,
@@ -133,7 +133,7 @@ def main(
             output = np.matmul(scores, xv, axes=[(1,2), (0,2), (0,2)]).reshape(-1, params['dim'])
             h += output @ wo.T
 
-            # Feed forward neural network
+            # Feed forward neural network with SiLU
             wn = data[f'layers.{layer}.ffn_norm.weight']
             w1 = data[f'layers.{layer}.feed_forward.w1.weight']
             w2 = data[f'layers.{layer}.feed_forward.w2.weight']
