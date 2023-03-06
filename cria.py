@@ -81,16 +81,19 @@ def main(
     # tokens += [tokenizer.pad_id()] * n_tokens_to_generate
     print(f"Encoded \"{prompt}\" to {tokens}")
 
-    for _ in range(n_tokens_to_generate):
+    cache_k = [None] * params['n_layers']
+    cache_v = [None] * params['n_layers']
+    prev_pos = 0
+    for cur_pos in range(len(tokens), len(tokens) + n_tokens_to_generate):
 
         # Embed tokens
-        h = data['tok_embeddings.weight'][tokens,:].astype(np.float32)
-        # print("h = ", h.shape, h)
-        # TODO: Cache
-
-        start_pos = 0
-        seq_len = len(tokens)
-        f = freqs_cis[start_pos : start_pos + seq_len].reshape(-1, 1, head_dim // 2)
+        token_view = tokens[prev_pos:cur_pos]
+        print("token_view = ", token_view)
+        h = data['tok_embeddings.weight'][token_view,:].astype(np.float32)
+        print("h = ", h.shape, h)
+        
+        seq_len = cur_pos - prev_pos
+        f = freqs_cis[prev_pos:cur_pos].reshape(-1, 1, head_dim // 2)
         # print("f = ", f.shape, f)
 
         for layer in range(params['n_layers']):
@@ -112,11 +115,20 @@ def main(
             xq = (xq.view(dtype=np.complex64) * f).view(dtype=np.float32)
             xk = (xk.view(dtype=np.complex64) * f).view(dtype=np.float32)
 
+            # Cache
+            if prev_pos == 0:
+                cache_k[layer] = xk
+                cache_v[layer] = xv
+            else:
+                xk = cache_k[layer] = np.concatenate((cache_k[layer], xk), axis=0)
+                xv = cache_v[layer] = np.concatenate((cache_v[layer], xv), axis=0)
+            # print("xk = ", xk.shape, xk)
+
             # Attention
             scores = np.matmul(xk, xq, axes=[(0,2),(2,0),(2,1)]) / np.sqrt(head_dim)
-            #if mask:
-            mask = -1e10 * (1 - np.tri(seq_len))
-            scores += mask
+            if seq_len > 1:
+                mask = -1e10 * (1 - np.tri(seq_len))
+                scores += mask
             scores = softmax(scores)
             output = np.matmul(scores, xv, axes=[(1,2), (0,2), (0,2)]).reshape(-1, params['dim'])
             h += output @ wo.T
@@ -131,6 +143,7 @@ def main(
             h += ((x1 / (1.0 + np.exp(-x1))) * (xn @ w3.T)) @ w2.T
 
             #print("h = ", h.shape, h)
+            # break
         
         # Output norm
         wn = data['norm.weight']
@@ -141,6 +154,8 @@ def main(
         # Select next token
         # TODO: Temperature
         tokens.append(int(np.argmax(logits)))
+
+        prev_pos = cur_pos
 
         # Untokenize result
         result = tokenizer.decode(tokens)
