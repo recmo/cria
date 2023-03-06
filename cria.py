@@ -8,12 +8,12 @@ import numpy as np
 
 from sentencepiece import SentencePieceProcessor
 
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
-    freqs = 1.0 / (theta ** (np.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = np.arange(end, device=freqs.device)  # type: ignore
-    freqs = np.outer(t, freqs).float()  # type: ignore
-    freqs_cis = np.polar(np.ones_like(freqs), freqs)  # complex64
-    return freqs_cis
+def rms_norm(x):
+    return (x / np.sqrt(np.square(x).mean(-1, keepdims=True) + 1e-6))
+
+def softmax(x):
+    exp_x = np.exp(x - np.max(x, axis=-1, keepdims=True))
+    return exp_x / np.sum(exp_x, axis=-1, keepdims=True)
 
 def main(
     prompt: str = "I believe the meaning of life is",
@@ -30,7 +30,7 @@ def main(
     # print(f"pad_id: {tokenizer.pad_id()}")
 
     # Load model
-    # PyTorch uses an uncompressed zip file containing a single pickle file and raw tensor data.
+    # PyTorch uses an uncompressed zip file containing a single pickle file and raw float data.
     # Since it's uncompressed, we'll memmap it directly from archive to save memory.
     with open(f'{models_dir}/{model_size}/params.json') as f:
         params = json.load(f)
@@ -66,23 +66,13 @@ def main(
             data = Unpickler(data_pkl).load()
 
     print(params)
-    # for (key, value) in data.items():
-    #     print(key, value.shape)
-    dim = params['dim']
+    for (key, value) in data.items():
+        print(key, value.shape)
+    head_dim = params['dim'] // params['n_heads']
     
     # Compute freq_cis
-    theta = 10000.0
-    freqs = 1.0 / (theta ** (np.arange(0, dim, 2)[: (dim // 2)] / dim))
-    print(freqs)
-    t = np.arange(max_seq_len * 2)
-    freqs = np.outer(t, freqs)
-    print(freqs)
-    freqs_cis = np.exp(freqs * 1j)
-    print(freqs_cis)
-
-
-    # freq_cis = precompute_freqs_cis(params['dim'] // params['n_heads'], )
-
+    freqs = np.logspace(0, 1.0, base=1e-4, num=head_dim // 2, endpoint=False)
+    freqs_cis = np.exp(1j * np.outer(np.arange(2 * max_seq_len), freqs)).astype(np.complex64)
 
     # Tokenize prompt
     tokens = [tokenizer.bos_id()] + tokenizer.encode(prompt)
@@ -90,9 +80,58 @@ def main(
     print(f"Encoded \"{prompt}\" to {tokens}")
 
     # Embed tokens
-    tokens = data['tok_embeddings.weight'][tokens,:]
-    print(tokens.shape, tokens)
-    freqs_cis = data['freqs_cis.weight']
+    h = data['tok_embeddings.weight'][tokens,:].astype(np.float32)
+    print("h = ", h.shape, h)
+
+    start_pos = 0
+    seq_len = 8
+    freqs_cis = freqs_cis[start_pos : start_pos + seq_len]
+    # print("freqs_cis = ", freqs_cis.shape, freqs_cis)
+
+    for layer in range(32):
+        print("layer = ", layer)
+
+        ## Attention
+
+        # Attention norm
+        wa = data[f'layers.{layer}.attention_norm.weight']
+        xn = rms_norm(h) * wa
+
+        # QKV projections
+        wq = data[f'layers.{layer}.attention.wq.weight']
+        wk = data[f'layers.{layer}.attention.wk.weight']
+        wv = data[f'layers.{layer}.attention.wv.weight']
+        shape = (-1, params['n_heads'], head_dim)
+        xq = (xn @ wq.T).reshape(shape)
+        xk = (xn @ wk.T).reshape(shape)
+        xv = (xn @ wv.T).reshape(shape)
+
+        # Rotary embedding
+        f = freqs_cis.reshape(-1, 1, xq.shape[-1] // 2)
+        xq = (xq.view(dtype=np.complex64) * f).view(dtype=np.float32)
+        xk = (xk.view(dtype=np.complex64) * f).view(dtype=np.float32)
+
+        # Attention
+        scores = np.matmul(xk, xq, axes=[(0,2),(2,0),(2,1)]) / np.sqrt(head_dim)
+        if layer == 0:
+            mask = -1e10 * (1 - np.tri(seq_len))
+            scores += mask
+        scores = softmax(scores)
+        output = np.matmul(scores, xv, axes=[(1,2), (0,2), (0,2)]).reshape(-1, params['dim'])
+
+        # Output projection
+        wo = data[f'layers.{layer}.attention.wo.weight']
+        h = h + output @ wo.T
+        print("h = ", h.shape, h)
+
+        ## Feed forward neural network
+        
+        # Feed forward norm
+        wn = data[f'layers.{layer}.ffn_norm.weight']
+        xn = rms_norm(h) * wn
+        print("xn = ", xn.shape, xn)
+
+        assert False
 
     # Untokenize result
     #result = tokenizer.decode(tokens)
