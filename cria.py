@@ -88,20 +88,17 @@ def main(
     freqs_cis = freqs_cis[start_pos : start_pos + seq_len]
     # print("freqs_cis = ", freqs_cis.shape, freqs_cis)
 
-    for layer in range(32):
+    for layer in range(params['n_layers']):
         print("layer = ", layer)
 
-        ## Attention
-
-        # Attention norm
-        wa = data[f'layers.{layer}.attention_norm.weight']
-        xn = rms_norm(h) * wa
-
         # QKV projections
+        wa = data[f'layers.{layer}.attention_norm.weight']
         wq = data[f'layers.{layer}.attention.wq.weight']
         wk = data[f'layers.{layer}.attention.wk.weight']
         wv = data[f'layers.{layer}.attention.wv.weight']
+        wo = data[f'layers.{layer}.attention.wo.weight']
         shape = (-1, params['n_heads'], head_dim)
+        xn = rms_norm(h) * wa
         xq = (xn @ wq.T).reshape(shape)
         xk = (xn @ wk.T).reshape(shape)
         xv = (xn @ wv.T).reshape(shape)
@@ -113,25 +110,23 @@ def main(
 
         # Attention
         scores = np.matmul(xk, xq, axes=[(0,2),(2,0),(2,1)]) / np.sqrt(head_dim)
-        if layer == 0:
-            mask = -1e10 * (1 - np.tri(seq_len))
-            scores += mask
+        #if layer == 0:
+        mask = -1e10 * (1 - np.tri(seq_len))
+        scores += mask
         scores = softmax(scores)
         output = np.matmul(scores, xv, axes=[(1,2), (0,2), (0,2)]).reshape(-1, params['dim'])
+        h += output @ wo.T
 
-        # Output projection
-        wo = data[f'layers.{layer}.attention.wo.weight']
-        h = h + output @ wo.T
-        print("h = ", h.shape, h)
-
-        ## Feed forward neural network
-        
-        # Feed forward norm
+        # Feed forward neural network
         wn = data[f'layers.{layer}.ffn_norm.weight']
+        w1 = data[f'layers.{layer}.feed_forward.w1.weight']
+        w2 = data[f'layers.{layer}.feed_forward.w2.weight']
+        w3 = data[f'layers.{layer}.feed_forward.w3.weight']
         xn = rms_norm(h) * wn
-        print("xn = ", xn.shape, xn)
+        x1 = xn @ w1.T
+        h += ((x1 / (1.0 + np.exp(-x1))) * (xn @ w3.T)) @ w2.T
 
-        assert False
+        print("h = ", h.shape, h)
 
     # Untokenize result
     #result = tokenizer.decode(tokens)
